@@ -20,8 +20,13 @@
 #include "lv_drivers/indev/keyboard.h"
 #include "lv_drivers/indev/mousewheel.h"
 
+
+# // be sure to get the sim headers for SimpleWeatherService.h
+#include "host/ble_gatt.h"
+#include "host/ble_uuid.h"
+
 // get PineTime header
-#include "displayapp/lv_pinetime_theme.h"
+#include "displayapp/InfiniTimeTheme.h"
 #include <drivers/Hrs3300.h>
 #include <drivers/Bma421.h>
 
@@ -51,18 +56,28 @@
 #include "displayapp/LittleVgl.h"
 
 #include <nrfx_gpiote.h>
+#include <hal/nrf_gpio.h>
+#include <mdk/nrf52.h> // initialize NRF_WDT and NRF_POWER
 
 #include <iostream>
 #include <typeinfo>
 #include <algorithm>
+#include <array>
+#include <vector>
+#include <span>
 #include <cmath> // std::pow
 
 // additional includes for 'saveScreenshot()' function
-#include <date/date.h>
+#include <iomanip> // put_time
+#include <sstream>
 #include <chrono>
+#include <ctime>   // localtime
 #if defined(WITH_PNG)
-#include <libpng16/png.h>
+#include <png.h>
 #endif
+#include <gif.h>
+
+#include "img/sim_background.h" // provides variable SIM_BACKGROUND
 
 /*********************
  *      DEFINES
@@ -91,8 +106,13 @@ extern monitor_t monitor;
 void saveScreenshot()
 {
   auto now = std::chrono::system_clock::now();
-  // TODO: timestamped png filename
-  std::string screenshot_filename_base = date::format("InfiniSim_%F_%H%M%S", date::floor<std::chrono::seconds>(now));
+  auto in_time_t = std::chrono::system_clock::to_time_t(now);
+  // timestamped png filename
+  std::stringstream ss;
+  ss << "InfiniSim_" << std::put_time(std::localtime(&in_time_t), "%F_%H%M%S");
+  std::string screenshot_filename_base = ss.str();
+  // TODO: use std::format once we have C++20 and new enough GCC 13
+  //std::string screenshot_filename_base = std::format("InfiniSim_%F_%H%M%S", std::chrono::floor<std::chrono::seconds>(now));
   //std::string screenshot_filename_base = "InfiniSim";
 
   const int width = 240;
@@ -131,16 +151,17 @@ void saveScreenshot()
   for (int i = 0; i < height; i++) {
       row_pointers[i] = (png_bytep)png_malloc(png_ptr, width*4);
   }
+  constexpr size_t zoom = MONITOR_ZOOM;
   const Uint32 format = SDL_PIXELFORMAT_RGBA8888;
-  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, format);
+  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, width*zoom, height*zoom, 32, format);
   SDL_RenderReadPixels(renderer, NULL, format, surface->pixels, surface->pitch);
   png_bytep pixels = (png_bytep)surface->pixels;
   for (int hi = 0; hi < height; hi++) {
     for (int wi = 0; wi < width; wi++) {
       int c = wi * 4;
-      row_pointers.at(hi)[wi*4+0] = pixels[hi*surface->pitch + wi*4 + 3]; // red
-      row_pointers.at(hi)[wi*4+1] = pixels[hi*surface->pitch + wi*4 + 2]; // greeen
-      row_pointers.at(hi)[wi*4+2] = pixels[hi*surface->pitch + wi*4 + 1]; // blue
+      row_pointers.at(hi)[wi*4+0] = pixels[hi*surface->pitch*zoom + wi*4*zoom + 3]; // red
+      row_pointers.at(hi)[wi*4+1] = pixels[hi*surface->pitch*zoom + wi*4*zoom + 2]; // greeen
+      row_pointers.at(hi)[wi*4+2] = pixels[hi*surface->pitch*zoom + wi*4*zoom + 1]; // blue
       row_pointers.at(hi)[wi*4+3] = 255; // alpha
     }
   }
@@ -163,6 +184,85 @@ void saveScreenshot()
 #endif
   std::cout << "InfiniSim: Screenshot created: " << screenshot_filename << std::endl;
 }
+
+class GifManager
+{
+private:
+  GifWriter writer = {};
+  std::chrono::system_clock::time_point last_frame;
+  bool in_progress = false;
+  static constexpr uint32_t delay_ds = 100/20; // in 1/100 s, so 1 ds = 10 ms
+  static constexpr int sdl_width = 240;
+  static constexpr int sdl_height = 240;
+
+public:
+  GifManager()
+  {}
+  ~GifManager()
+  {
+    if (in_progress) {
+      close();
+    }
+  }
+
+  bool is_in_progress() const
+  {
+    return in_progress;
+  }
+  void create_new()
+  {
+    assert(!in_progress);
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    // timestamped png filename
+    std::stringstream ss;
+    ss << "InfiniSim_" << std::put_time(std::localtime(&in_time_t), "%F_%H%M%S");
+    std::string screenshot_filename_base = ss.str();
+    // TODO: use std::format once we have C++20 and new enough GCC 13
+    //std::string screenshot_filename_base = std::format("InfiniSim_%F_%H%M%S", std::chrono::floor<std::chrono::seconds>(now));
+    std::string screenshot_filename = screenshot_filename_base + ".gif";
+    std::cout << "InfiniSim: Screen-capture started: " << screenshot_filename << std::endl;
+    GifBegin( &writer, screenshot_filename.c_str(), sdl_width, sdl_height, delay_ds, 8, true );
+    in_progress = true;
+    write_frame(true);
+  }
+  void write_frame(bool force = false)
+  {
+    assert(in_progress);
+    auto now = std::chrono::system_clock::now();
+    if (force || ((now - last_frame) > std::chrono::milliseconds(delay_ds*10)) )
+    {
+      last_frame = std::chrono::system_clock::now();
+      auto renderer = monitor.renderer;
+      constexpr size_t zoom = MONITOR_ZOOM;
+      const Uint32 format = SDL_PIXELFORMAT_RGBA8888;
+      SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, sdl_width*zoom, sdl_height*zoom, 32, format);
+      SDL_RenderReadPixels(renderer, NULL, format, surface->pixels, surface->pitch);
+      uint8_t *pixels = (uint8_t*) surface->pixels;
+
+      std::array<uint8_t, 240*240*4> image;
+      for (int hi = 0; hi < sdl_height; hi++) {
+        for (int wi = 0; wi < sdl_width; wi++) {
+          auto red   = pixels[hi*surface->pitch*zoom + wi*4*zoom + 3]; // red
+          auto green = pixels[hi*surface->pitch*zoom + wi*4*zoom + 2]; // green
+          auto blue  = pixels[hi*surface->pitch*zoom + wi*4*zoom + 1]; // blue
+          image[(hi * sdl_width + wi)*4 + 0] = red;
+          image[(hi * sdl_width + wi)*4 + 1] = green;
+          image[(hi * sdl_width + wi)*4 + 2] = blue;
+          image[(hi * sdl_width + wi)*4 + 3] = 255; // no alpha
+        }
+      }
+      GifWriteFrame(&writer, image.data(), sdl_width, sdl_height, delay_ds, 8, false);
+    }
+  }
+  void close()
+  {
+    assert(in_progress);
+    in_progress = false;
+    GifEnd(&writer);
+    std::cout << "InfiniSim: Screen-capture finished" << std::endl;
+  }
+};
 
 /**********************
  *  STATIC PROTOTYPES
@@ -221,10 +321,10 @@ Pinetime::Drivers::SpiMaster spi {Pinetime::Drivers::SpiMaster::SpiModule::SPI0,
                                    Pinetime::PinMap::SpiMiso}};
 
 Pinetime::Drivers::Spi lcdSpi {spi, Pinetime::PinMap::SpiLcdCsn};
-Pinetime::Drivers::St7789 lcd {lcdSpi, Pinetime::PinMap::LcdDataCommand};
+Pinetime::Drivers::St7789 lcd {lcdSpi, Pinetime::PinMap::LcdDataCommand, Pinetime::PinMap::LcdReset};
 
 Pinetime::Drivers::Spi flashSpi {spi, Pinetime::PinMap::SpiFlashCsn};
-Pinetime::Drivers::SpiNorFlash spiNorFlash {flashSpi};
+Pinetime::Drivers::SpiNorFlash spiNorFlash {"spiNorFlash.raw"};
 
 // The TWI device should work @ up to 400Khz but there is a HW bug which prevent it from
 // respecting correct timings. According to erratas heet, this magic value makes it run
@@ -239,8 +339,6 @@ Pinetime::Drivers::Cst816S touchPanel; // {twiMaster, touchPanelTwiAddress};
 //  #include "displayapp/LittleVgl.h"
 //  #include "displayapp/DisplayApp.h"
 //#endif
-Pinetime::Components::LittleVgl lvgl {lcd, touchPanel};
-
 Pinetime::Drivers::Bma421 motionSensor {twiMaster, motionSensorTwiAddress};
 Pinetime::Drivers::Hrs3300 heartRateSensor {twiMaster, heartRateSensorTwiAddress};
 
@@ -252,52 +350,60 @@ Pinetime::Controllers::Ble bleController;
 Pinetime::Controllers::HeartRateController heartRateController;
 Pinetime::Applications::HeartRateTask heartRateApp(heartRateSensor, heartRateController);
 
-Pinetime::Controllers::FS fs; // {spiNorFlash};
+Pinetime::Controllers::FS fs {spiNorFlash};
 Pinetime::Controllers::Settings settingsController {fs};
 Pinetime::Controllers::MotorController motorController {};
 
 Pinetime::Controllers::DateTime dateTimeController {settingsController};
 Pinetime::Drivers::Watchdog watchdog;
-Pinetime::Drivers::WatchdogView watchdogView(watchdog);
 Pinetime::Controllers::NotificationManager notificationManager;
 Pinetime::Controllers::MotionController motionController;
+#if defined(INFINITIME_TIMERCONTROLLER)
 Pinetime::Controllers::TimerController timerController;
+#endif
+
+#if defined(ALARMCONTROLLER_NEEDS_FS)
+Pinetime::Controllers::AlarmController alarmController {dateTimeController, fs};
+#else
 Pinetime::Controllers::AlarmController alarmController {dateTimeController};
-Pinetime::Controllers::TouchHandler touchHandler(touchPanel, lvgl);
+#endif
+Pinetime::Controllers::TouchHandler touchHandler;
 Pinetime::Controllers::ButtonHandler buttonHandler;
 Pinetime::Controllers::BrightnessController brightnessController {};
 
 Pinetime::Applications::DisplayApp displayApp(lcd,
-                                              lvgl,
                                               touchPanel,
                                               batteryController,
                                               bleController,
                                               dateTimeController,
-                                              watchdogView,
+                                              watchdog,
                                               notificationManager,
                                               heartRateController,
                                               settingsController,
                                               motorController,
                                               motionController,
+                                              #if defined(INFINITIME_TIMERCONTROLLER)
                                               timerController,
+                                              #endif
                                               alarmController,
                                               brightnessController,
-                                              touchHandler);
+                                              touchHandler,
+                                              fs,
+                                              spiNorFlash);
 
 Pinetime::System::SystemTask systemTask(spi,
-                                        lcd,
                                         spiNorFlash,
                                         twiMaster,
                                         touchPanel,
-                                        lvgl,
                                         batteryController,
                                         bleController,
                                         dateTimeController,
+                                        #if defined(INFINITIME_TIMERCONTROLLER)
                                         timerController,
+                                        #endif
                                         alarmController,
                                         watchdog,
                                         notificationManager,
-                                        motorController,
                                         heartRateSensor,
                                         motionController,
                                         motionSensor,
@@ -332,13 +438,25 @@ public:
           SDL_RenderPresent(renderer);    // Reflects the changes done in the
                                           //  window.
         }
+        init_NRF_WDT();
+        init_NRF_POWER();
+
+        // Attempt to load background BMP from memory for the status display window
+        const size_t SIM_BACKGROUND_size = sizeof(SIM_BACKGROUND);
+        SDL_RWops *rw = SDL_RWFromMem((void*)SIM_BACKGROUND, SIM_BACKGROUND_size);
+        SDL_Surface* simDisplayBgRaw = SDL_LoadBMP_RW(rw, 1);
+        if (simDisplayBgRaw == NULL) {
+          printf("Failed to load sim background image: %s\n", SDL_GetError());
+        } else {
+          // convert the loaded image into a texture
+          simDisplayTexture = SDL_CreateTextureFromSurface(renderer, simDisplayBgRaw);
+          SDL_FreeSurface(simDisplayBgRaw);
+          simDisplayBgRaw = NULL;
+        }
         motorController.Init();
         settingsController.Init();
 
-        lvgl.Init();
-
-        lv_mem_monitor(&mem_mon);
-        printf("initial free_size = %u\n", mem_mon.free_size);
+        printf("initial free_size = %u\n", xPortGetFreeHeapSize());
 
         // update time to current system time once on startup
         dateTimeController.SetCurrentTime(std::chrono::system_clock::now());
@@ -352,6 +470,9 @@ public:
 
     // Destructor
     ~Framework(){
+        if (simDisplayTexture != NULL) {
+          SDL_DestroyTexture(simDisplayTexture);
+        }
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
@@ -394,6 +515,8 @@ public:
     }
 
     void refresh() {
+      // left edge for all "bubbles" (circles)
+      constexpr const int bubbleLeftEdge = 65;
       // always refresh the LVGL screen
       this->refresh_screen();
 
@@ -402,27 +525,23 @@ public:
       }
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
         SDL_RenderClear(renderer);
-        { // motorController.is_ringing
-          constexpr const int center_x = 15;
-          constexpr const int center_y = 15;
-          if (motorController.is_ringing) {
-              draw_circle_red(center_x, center_y, 15);
-          } else {
-              draw_circle_grey(center_x, center_y, 15);
-          }
+        // Render the background if it was able to be loaded
+        if (simDisplayTexture != NULL) {
+          SDL_RenderCopy(renderer, simDisplayTexture, NULL, NULL);
         }
         { // motorController.motor_is_running
-          constexpr const int center_x = 45;
-          constexpr const int center_y = 15;
-          if (motorController.motor_is_running) {
+          constexpr const int center_x = bubbleLeftEdge;
+          constexpr const int center_y = 216;
+          bool motor_is_running = nrf_gpio_pin_read(Pinetime::PinMap::Motor);
+          if (motor_is_running) {
               draw_circle_red(center_x, center_y, 15);
           } else {
               draw_circle_grey(center_x, center_y, 15);
           }
         }
         { // ble.motor_is_running
-          constexpr const int center_x = 75;
-          constexpr const int center_y = 15;
+          constexpr const int center_x = bubbleLeftEdge;
+          constexpr const int center_y = 24;
           if (bleController.IsConnected()) {
               draw_circle_blue(center_x, center_y, 15);
           } else {
@@ -430,18 +549,31 @@ public:
           }
         }
         // batteryController.percentRemaining
-        for (uint8_t percent=0; percent<=10; percent++) {
-          const int center_x = 15+15*percent;
-          const int center_y = 60;
-          if (batteryController.percentRemaining < percent*10) {
-            draw_circle_grey(center_x, center_y, 15);
-          } else {
-            draw_circle_green(center_x, center_y, 15);
-          }
+        {
+          const int center_x = bubbleLeftEdge;
+          const int center_y = 164;
+          const int max_bar_length = 150;
+          const int filled_bar_length = max_bar_length * (batteryController.percentRemaining/100.0);
+          const int rect_height = 14;
+          SDL_Rect rect {
+            .x = center_x - rect_height/2,
+            .y = center_y,
+            .w = max_bar_length,
+            .h = rect_height
+          };
+          SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
+          SDL_RenderDrawRect(renderer, &rect);
+
+          rect.w = filled_bar_length;
+          rect.h++;
+          rect.h-=2;
+          SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
+          SDL_RenderFillRect(renderer, &rect);
+          //set color and new x pos, draw again
         }
         { // batteryController.isCharging
-          constexpr const int center_x = 15;
-          constexpr const int center_y = 90;
+          constexpr const int center_x = bubbleLeftEdge;
+          constexpr const int center_y = 120;
           if (batteryController.isCharging) {
               draw_circle_yellow(center_x, center_y, 15);
           } else
@@ -450,7 +582,7 @@ public:
           }
         }
         { // brightnessController.Level
-          constexpr const int center_y = 15;
+          constexpr const int center_y = 72;
           const Pinetime::Controllers::BrightnessController::Levels level = brightnessController.Level();
           uint8_t level_idx = 0;
           if (level == Pinetime::Controllers::BrightnessController::Levels::Low)
@@ -464,11 +596,12 @@ public:
             level_idx = 3;
           }
           for (uint8_t i=0; i<4; i++) {
-            const int center_x = 115+15*i;
+            const int bubble_size = (i*2) + 5;
+            const int center_x = bubbleLeftEdge + ((bubble_size+10) * i) - 5;
             if (i <= level_idx) {
-              draw_circle_white(center_x, center_y, 15);
+              draw_circle_white(center_x, center_y, bubble_size);
             } else {
-              draw_circle_grey(center_x, center_y, 15);
+              draw_circle_grey(center_x, center_y, bubble_size);
             }
           }
         }
@@ -478,27 +611,27 @@ public:
 
     // prepared notficitions, one per message category
     const std::vector<std::string> notification_messages {
-      "category:\nUnknown",
+      "0category:\nUnknown",
       "Lorem ipsum\ndolor sit amet,\nconsectetur adipiscing elit,\n",
-      "SimpleAlert",
+      "1SimpleAlert",
       "sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-      "Email:",
+      "2Email:",
       "Vitae aliquet nec ullamcorper sit amet.",
-      "News:",
+      "3News:",
       "Id\naliquet\nrisus\nfeugiat\nin\nante\nmetus\ndictum\nat.",
-      "IncomingCall:",
+      "4IncomingCall:",
       "Ut porttitor leo a diam sollicitudin.",
-      "MissedCall:",
+      "5MissedCall:",
       "Ultrices tincidunt arcu non sodales neque sodales ut etiam sit.",
-      "Sms:",
+      "6Sms:",
       "Pellentesque dignissim enim sit amet.",
-      "VoiceMail:",
+      "7VoiceMail:",
       "Urna nec tincidunt praesent semper feugiat nibh sed pulvinar proin.",
-      "Schedule:",
+      "8Schedule:",
       "Tellus id interdum velit laoreet id donec ultrices tincidunt.",
-      "HighProriotyAlert:",
+      "9HighProriotyAlert:",
       "Viverra maecenas accumsan lacus vel facilisis volutpat est velit egestas.",
-      "InstantMessage:",
+      "10InstantMessage:",
       "Volutpat consequat mauris nunc congue.",
     };
     size_t notification_idx = 0; // which message to send next
@@ -515,8 +648,16 @@ public:
       notificationManager.Push(std::move(notif));
       // send next message the next time
       notification_idx++;
-      if (notification_idx >= notification_messages.size()) {
+      if (notification_idx >= notification_messages.size()/2) {
         notification_idx = 0;
+      }
+      if (settingsController.GetNotificationStatus() == Pinetime::Controllers::Settings::Notification::On)
+      {
+        if (screen_off_created) {
+          // wake up! (deletes screen_off label)
+          systemTask.PushMessage(Pinetime::System::Messages::GoToRunning);
+        }
+        displayApp.PushMessage(Pinetime::Applications::Display::Messages::NewNotification);
       }
     }
 
@@ -550,6 +691,7 @@ public:
       debounce('s', 'S', state[SDL_SCANCODE_S], key_handled_s);
       debounce('h', 'H', state[SDL_SCANCODE_H], key_handled_h);
       debounce('i', 'I', state[SDL_SCANCODE_I], key_handled_i);
+      debounce('w', 'W', state[SDL_SCANCODE_W], key_handled_w);
       // screen switcher buttons
       debounce('1', '!'+1, state[SDL_SCANCODE_1], key_handled_1);
       debounce('2', '!'+2, state[SDL_SCANCODE_2], key_handled_2);
@@ -561,6 +703,24 @@ public:
       debounce('8', '!'+8, state[SDL_SCANCODE_8], key_handled_8);
       debounce('9', '!'+9, state[SDL_SCANCODE_9], key_handled_9);
       debounce('0', '!'+0, state[SDL_SCANCODE_0], key_handled_0);
+      // direction keys
+      debounce(':', ':', state[SDL_SCANCODE_UP], key_handled_up);
+      debounce(';', ';', state[SDL_SCANCODE_DOWN], key_handled_down);
+      debounce('<', '<', state[SDL_SCANCODE_LEFT], key_handled_left);
+      debounce('>', '>', state[SDL_SCANCODE_RIGHT], key_handled_right);
+    }
+    // inject a swipe gesture to the touch handler and notify displayapp to notice it
+    void send_gesture(Pinetime::Drivers::Cst816S::Gestures gesture)
+    {
+      Pinetime::Drivers::Cst816S::TouchInfos info;
+      info.isValid = true;
+      info.touching = true;
+      info.gesture = gesture;
+      touchHandler.ProcessTouchInfo(info);
+      displayApp.PushMessage(Pinetime::Applications::Display::Messages::TouchEvent);
+      info.touching = false;
+      info.gesture = Pinetime::Drivers::Cst816S::Gestures::None;
+      touchHandler.ProcessTouchInfo(info);
     }
     // modify the simulated controller depending on the pressed key
     void handle_key(SDL_Keycode key) {
@@ -598,9 +758,9 @@ public:
       } else if (key == 'C') {
         batteryController.isCharging = false;
         batteryController.isPowerPresent = false;
-      } else if (key == 'l') {
+      } else if (key == 'l' && !screen_off_created) {
         brightnessController.Higher();
-      } else if (key == 'L') {
+      } else if (key == 'L' && !screen_off_created) {
         brightnessController.Lower();
       } else if (key == 'p') {
         this->print_memory_usage = true;
@@ -627,12 +787,121 @@ public:
         heartRateController.Stop();
       } else if (key == 'i') {
         saveScreenshot();
+      } else if (key == 'I') {
+        if (!gif_manager.is_in_progress())
+        {
+          gif_manager.create_new();
+        } else {
+          gif_manager.close();
+        }
+      } else if (key == 'w') {
+        generate_weather_data(false);
+      } else if (key == 'W') {
+        generate_weather_data(true);
       } else if (key >= '0' && key <= '9') {
         this->switch_to_screen(key-'0');
       } else if (key >= '!'+0 && key <= '!'+9) {
         this->switch_to_screen(key-'!'+10);
+      } else if (key == ':') { // up
+        send_gesture(Pinetime::Drivers::Cst816S::Gestures::SlideUp);
+      } else if (key == ';') { // down
+        send_gesture(Pinetime::Drivers::Cst816S::Gestures::SlideDown);
+      } else if (key == '<') { // left
+        send_gesture(Pinetime::Drivers::Cst816S::Gestures::SlideLeft);
+      } else if (key == '>') { // up
+        send_gesture(Pinetime::Drivers::Cst816S::Gestures::SlideRight);
       }
       batteryController.voltage = batteryController.percentRemaining * 50;
+    }
+
+    void write_uint64(std::span<uint8_t> data, uint64_t val)
+    {
+      assert(data.size() >= 8);
+      for (int i=0; i<8; i++)
+      {
+        data[i] = (val >> (i*8)) & 0xff;
+      }
+    }
+    void write_int16(std::span<uint8_t> data, int16_t val)
+    {
+      assert(data.size() >= 2);
+      data[0] = val & 0xff;
+      data[1] = (val >> 8) & 0xff;
+    }
+    void set_current_weather(uint64_t timestamp, int16_t temperature, int iconId)
+    {
+      std::array<uint8_t, 49> dataBuffer {};
+      std::span<uint8_t> data(dataBuffer);
+      os_mbuf buffer;
+      ble_gatt_access_ctxt ctxt;
+      ctxt.om = &buffer;
+      buffer.om_data = dataBuffer.data();
+
+      // fill buffer with specified format
+      int16_t minTemperature = temperature;
+      int16_t maxTemperature = temperature;
+      dataBuffer.at(0) = 0; // MessageType::CurrentWeather
+      dataBuffer.at(1) = 0; // Vesion 0
+      write_uint64(data.subspan(2), timestamp);
+      write_int16(data.subspan(10), temperature);
+      write_int16(data.subspan(12), minTemperature);
+      write_int16(data.subspan(14), maxTemperature);
+      dataBuffer.at(48) = static_cast<uint8_t>(iconId);
+
+      // send weather to SimpleWeatherService
+      systemTask.nimble().weather().OnCommand(&ctxt);
+    }
+    void set_forecast(
+      uint64_t timestamp,
+      std::array<
+      Pinetime::Controllers::SimpleWeatherService::Forecast::Day,
+      Pinetime::Controllers::SimpleWeatherService::MaxNbForecastDays> days)
+    {
+      std::array<uint8_t, 36> dataBuffer {};
+      std::span<uint8_t> data(dataBuffer);
+      os_mbuf buffer;
+      ble_gatt_access_ctxt ctxt;
+      ctxt.om = &buffer;
+      buffer.om_data = dataBuffer.data();
+
+      // fill buffer with specified format
+      dataBuffer.at(0) = 1; // MessageType::Forecast
+      dataBuffer.at(1) = 0; // Vesion 0
+      write_uint64(data.subspan(2), timestamp);
+      dataBuffer.at(10) = static_cast<uint8_t>(days.size());
+      for (int i = 0; i < days.size(); i++)
+      {
+        const Pinetime::Controllers::SimpleWeatherService::Forecast::Day &day = days.at(i);
+        write_int16(data.subspan(11+(i*5)), day.minTemperature);
+        write_int16(data.subspan(13+(i*5)), day.maxTemperature);
+        dataBuffer.at(15+(i*5)) = static_cast<uint8_t>(day.iconId);
+      }
+      // send Forecast to SimpleWeatherService
+      systemTask.nimble().weather().OnCommand(&ctxt);
+    }
+
+    void generate_weather_data(bool clear) {
+      if (clear) {
+        set_current_weather(0, 0, 0);
+        std::array<Pinetime::Controllers::SimpleWeatherService::Forecast::Day, Pinetime::Controllers::SimpleWeatherService::MaxNbForecastDays> days;
+        set_forecast(0, days);
+        return;
+      }
+      auto timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      srand((int)timestamp);
+
+      // Generate current weather data
+      int16_t temperature = (rand() % 81 - 40) * 100;
+      set_current_weather((uint64_t)timestamp, temperature, rand() % 9);
+
+      // Generate forecast data
+      std::array<Pinetime::Controllers::SimpleWeatherService::Forecast::Day, Pinetime::Controllers::SimpleWeatherService::MaxNbForecastDays> days;
+      for (int i = 0; i < Pinetime::Controllers::SimpleWeatherService::MaxNbForecastDays; i++) {
+        days[i] = Pinetime::Controllers::SimpleWeatherService::Forecast::Day {
+          (int16_t)(temperature - rand() % 10 * 100), (int16_t)(temperature + rand() % 10 * 100), Pinetime::Controllers::SimpleWeatherService::Icons(rand() % 9)
+        };
+      }
+      set_forecast((uint64_t)timestamp, days);
     }
 
     void handle_touch_and_button() {
@@ -662,15 +931,15 @@ public:
     void switch_to_screen(uint8_t screen_idx)
     {
       if (screen_idx == 1) {
-        settingsController.SetClockFace(0);
+        settingsController.SetWatchFace(Pinetime::Applications::WatchFace::Digital);
         displayApp.StartApp(Pinetime::Applications::Apps::Clock, Pinetime::Applications::DisplayApp::FullRefreshDirections::None);
       }
       else if (screen_idx == 2) {
-        settingsController.SetClockFace(1);
+        settingsController.SetWatchFace(Pinetime::Applications::WatchFace::Analog);
         displayApp.StartApp(Pinetime::Applications::Apps::Clock, Pinetime::Applications::DisplayApp::FullRefreshDirections::None);
       }
       else if (screen_idx == 3) {
-        settingsController.SetClockFace(2);
+        settingsController.SetWatchFace(Pinetime::Applications::WatchFace::PineTimeStyle);
         displayApp.StartApp(Pinetime::Applications::Apps::Clock, Pinetime::Applications::DisplayApp::FullRefreshDirections::None);
       }
       else if (screen_idx == 4) {
@@ -755,15 +1024,30 @@ public:
           lv_obj_del(screen_off_label);
         }
       }
+
       if (print_memory_usage) {
-        // print free memory with the knowledge that 14KiB RAM is the actual PineTime-Memory
-        lv_mem_monitor(&mem_mon);
-        printf("actual free_size = %d\n", int64_t(mem_mon.free_size) - (LV_MEM_SIZE - 14U*1024U));
+        auto currentFreeHeap = xPortGetFreeHeapSize();
+        if (currentFreeHeap != lastFreeHeapSize) {
+          auto minimumEverFreeHeap = xPortGetMinimumEverFreeHeapSize();
+          // 14KiB is the LVGL memory size used in InfiniTime
+          constexpr uint32_t pinetime_heap_memory = configTOTAL_HEAP_SIZE;
+          uint32_t mem_used = pinetime_heap_memory - currentFreeHeap;
+          // The "budget" value shows how much free lvgl memory the PineTime
+          // would have free and will go negative when more memory is used
+          // in the simulator than is available on the real hardware.
+          int32_t budget = configTOTAL_HEAP_SIZE - mem_used;
+          printf("Mem: %5u used (change: %+5d, peak: %5u) %d budget left\n", mem_used, lastFreeHeapSize - currentFreeHeap, minimumEverFreeHeap, budget);
+          lastFreeHeapSize = currentFreeHeap;
+        }
+      }
+
+      if (gif_manager.is_in_progress())
+      {
+        gif_manager.write_frame();
       }
     }
 
     bool print_memory_usage = false;
-    lv_mem_monitor_t mem_mon;
 
     // variables to create and destroy an lvgl overlay to indicate a turned off screen
     bool screen_off_created = false;
@@ -773,7 +1057,7 @@ public:
 private:
     bool key_handled_r = false; // r ... enable ringing, R ... disable ringing
     bool key_handled_m = false; // m ... let motor run, M ... stop motor
-    bool key_handled_n = false; // n ... send notification, N ... clear all notifications
+    bool key_handled_n = false; // n ... send notification, N ... clear new notification flag
     bool key_handled_b = false; // b ... connect Bluetooth, B ... disconnect Bluetooth
     bool key_handled_v = false; // battery Voltage and percentage, v ... increase, V ... decrease
     bool key_handled_c = false; // c ... charging, C ... not charging
@@ -781,7 +1065,8 @@ private:
     bool key_handled_p = false; // p ... enable print memory usage, P ... disable print memory usage
     bool key_handled_s = false; // s ... increase step count, S ... decrease step count
     bool key_handled_h = false; // h ... set heartrate running, H ... stop heartrate
-    bool key_handled_i = false; // i ... take screenshot, I ... not assigned
+    bool key_handled_i = false; // i ... take screenshot, I ... start/stop Gif screen capture
+    bool key_handled_w = false; // w ... generate weather data, W ... clear weather data
     // numbers from 0 to 9 to switch between screens
     bool key_handled_1 = false;
     bool key_handled_2 = false;
@@ -793,16 +1078,28 @@ private:
     bool key_handled_8 = false;
     bool key_handled_9 = false;
     bool key_handled_0 = false;
+    // direction arrows
+    bool key_handled_up = false;     // inject swipe up
+    bool key_handled_down = false;   // inject swipe down
+    bool key_handled_left = false;   // inject swipe left
+    bool key_handled_right = false;  // inject swipe right
     bool visible;   // show Simulator window
     int height;     // Height of the window
     int width;      // Width of the window
     SDL_Renderer *renderer = NULL;      // Pointer for the renderer
     SDL_Window *window = NULL;      // Pointer for the window
+    SDL_Texture* simDisplayTexture = NULL; // Background for the sim status window
 
     bool left_release_sent = true; // make sure to send one mouse button release event
     bool right_last_state = false; // varable used to send message only on changing state
+
+    size_t lastFreeHeapSize = configTOTAL_HEAP_SIZE;
+
+    GifManager gif_manager;
 };
 
+int mallocFailedCount = 0;
+int stackOverflowCount = 0;
 int main(int argc, char **argv)
 {
   // parse arguments
@@ -837,6 +1134,8 @@ int main(int argc, char **argv)
   /*Initialize the HAL (display, input devices, tick) for LVGL*/
   hal_init();
 
+  fs.Init();
+
   // initialize the core of our Simulator
   Framework fw(fw_status_window_visible, 240,240);
 
@@ -868,21 +1167,21 @@ static void hal_init(void)
   SDL_CreateThread(tick_thread, "tick", NULL);
 
   // use pinetime_theme
-  lv_theme_t* th = lv_pinetime_theme_init(
-    LV_COLOR_WHITE, LV_COLOR_SILVER, 0, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20);
-  lv_theme_set_act(th);
+  //lv_theme_t* th = lv_pinetime_theme_init(
+  //  LV_COLOR_WHITE, LV_COLOR_SILVER, 0, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20, &jetbrains_mono_bold_20);
+  //lv_theme_set_act(th);
 
-  /*Create a display buffer*/
-  static lv_disp_buf_t disp_buf1;
-  static lv_color_t buf1_1[LV_HOR_RES_MAX * 120];
-  lv_disp_buf_init(&disp_buf1, buf1_1, NULL, LV_HOR_RES_MAX * 120);
+  ///*Create a display buffer*/
+  //static lv_disp_buf_t disp_buf1;
+  //static lv_color_t buf1_1[LV_HOR_RES_MAX * 120];
+  //lv_disp_buf_init(&disp_buf1, buf1_1, NULL, LV_HOR_RES_MAX * 120);
 
-  /*Create a display*/
-  lv_disp_drv_t disp_drv;
-  lv_disp_drv_init(&disp_drv); /*Basic initialization*/
-  disp_drv.buffer = &disp_buf1;
-  disp_drv.flush_cb = monitor_flush;
-  lv_disp_drv_register(&disp_drv);
+  ///*Create a display*/
+  //lv_disp_drv_t disp_drv;
+  //lv_disp_drv_init(&disp_drv); /*Basic initialization*/
+  //disp_drv.buffer = &disp_buf1;
+  //disp_drv.flush_cb = monitor_flush;
+  //lv_disp_drv_register(&disp_drv);
 
   /* Add the mouse as input device
    * Use the 'mouse' driver which reads the PC's mouse*/

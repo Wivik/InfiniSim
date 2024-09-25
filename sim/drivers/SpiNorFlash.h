@@ -1,25 +1,26 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 
 namespace Pinetime {
   namespace Drivers {
     class Spi;
     class SpiNorFlash {
     public:
-      explicit SpiNorFlash(Spi& spi);
+      explicit SpiNorFlash(const std::string& memoryFilePath);
+      ~SpiNorFlash();
       SpiNorFlash(const SpiNorFlash&) = delete;
       SpiNorFlash& operator=(const SpiNorFlash&) = delete;
       SpiNorFlash(SpiNorFlash&&) = delete;
       SpiNorFlash& operator=(SpiNorFlash&&) = delete;
 
-      typedef struct __attribute__((packed)) {
+      struct __attribute__((packed)) Identification {
         uint8_t manufacturer = 0;
         uint8_t type = 0;
         uint8_t density = 0;
-      } Identification;
+      };
 
-      Identification ReadIdentificaion();
       uint8_t ReadStatusRegister();
       bool WriteInProgress();
       bool WriteEnabled();
@@ -32,6 +33,8 @@ namespace Pinetime {
       bool ProgramFailed();
       bool EraseFailed();
 
+      Identification GetIdentification() const;
+
       void Init();
       void Uninit();
 
@@ -39,6 +42,8 @@ namespace Pinetime {
       void Wakeup();
 
     private:
+      Identification ReadIdentification();
+
       enum class Commands : uint8_t {
         PageProgram = 0x02,
         Read = 0x03,
@@ -53,8 +58,12 @@ namespace Pinetime {
       };
       static constexpr uint16_t pageSize = 256;
 
-      Spi& spi;
+      static constexpr size_t memorySize {0x400000};
+      const std::string& memoryFilePath;
+
+
       Identification device_id;
+      std::fstream memoryFile;
     };
   }
 }

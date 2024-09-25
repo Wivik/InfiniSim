@@ -29,21 +29,37 @@
 #ifndef PORTMACRO_CMSIS_H
 #define PORTMACRO_CMSIS_H
 
-#include <cstdint>
+// ########## macro taken from app_util.h
+/**@brief Macro for performing rounded integer division (as opposed to truncating the result).
+ *
+ * @param[in]   A   Numerator.
+ * @param[in]   B   Denominator.
+ *
+ * @return      Rounded (integer) result of dividing A by B.
+ */
+#define ROUNDED_DIV(A, B) (((A) + ((B) / 2)) / (B))
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
 
 typedef uint32_t TickType_t;
 #define portMAX_DELAY ( TickType_t ) 0xffffffffUL
+#define portNRF_RTC_MAXTICKS   ((1U<<24)-1U)
 
 typedef long BaseType_t;
 typedef unsigned long UBaseType_t;
-#define pdFALSE ( ( BaseType_t ) 0 )
-#define pdTRUE  ( ( BaseType_t ) 1 )
-#define pdPASS pdTRUE
 
 /* RTC register */
-using NRF_RTC_Type = uint32_t;
-constexpr NRF_RTC_Type portNRF_RTC_REG = 1;
+typedef uint32_t NRF_RTC_Type;
+const NRF_RTC_Type portNRF_RTC_REG = 1;
 
 void portYIELD_FROM_ISR(BaseType_t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PORTMACRO_CMSIS_H */
